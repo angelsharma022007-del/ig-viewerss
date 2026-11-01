@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+import argparse, base64, getpass, json, os, sys, time
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx, instaloader, uvicorn
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+BASE = Path(__file__).parent
+SESSION_FILE = BASE / "session"
+IG_USER = os.environ.get("IG_USERNAME", "").strip()
+CACHE_TTL, STORY_TTL = 300, 60
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/122.0 Safari/537.36")
+ALLOWED = (".cdninstagram.com", ".fbcdn.net", "instagram.com")
+
+L = instaloader.Instaloader(quiet=True, download_video_thumbnails=False,
+                            save_metadata=False, post_metadata_txt_pattern="",
+                            max_connection_attempts=2)
+_cache: dict[str, tuple[float, Any]] = {}
+
+def restore_session():
+    raw = os.environ.get("IG_SESSION")
+    if raw and not SESSION_FILE.exists():
+        try:
+            SESSION_FILE.write_bytes(base64.b64decode(raw))
+        except Exception as e:
+            print("session restore failed:", e, file=sys.stderr)
+
+def cached(key, fn, ttl=CACHE_TTL):
+    hit = _cache.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _cache[key] = (time.time(), val)
+    return val
+
+def ctx():
+    restore_session()
+    if not SESSION_FILE.exists():
+        raise HTTPException(503, "no session - run: python app.py --login")
+    if not L.context.is_logged_in:
+        L.load_session_from_file(IG_USER, str(SESSION_FILE))
+    return L
+
+def get_profile(username: str) -> instaloader.Profile:
+    try:
+        return instaloader.Profile.from_username(ctx().context, username)
+    except instaloader.exceptions.ProfileNotExistsException:
+        raise HTTPException(404, f"@{username} does not exist")
+
+def blocked(p) -> bool:
+    return p.is_private and not p.followed_by_viewer
+
+def ser(node, kind="post") -> dict:
+    vid = node.is_video
+    out = {"id": node.shortcode if kind == "post" else str(node.mediaid), "kind": kind,
+           "is_video": vid, "thumb": node.url, "url": node.video_url if vid else node.url,
+           "caption": (node.caption or "") if kind == "post" else "",
+           "likes": getattr(node, "likes", None), "comments": getattr(node, "comments", None),
+           "taken_at": node.date_utc.isoformat(), "carousel": []}
+    if getattr(node, "typename", "") == "GraphSidecar":
+        for n in node.get_sidecar_nodes():
+            out["carousel"].append({"is_video": n.is_video,
+                                    "url": n.video_url if n.is_video else n.url, "thumb": n.url})
+    return out
+
+app = FastAPI(title="ig-viewer", docs_url=None, redoc_url=None)
+
+@app.get("/api/health")
+def health():
+    restore_session()
+    return {"ok": SESSION_FILE.exists(), "session_account": IG_USER}
+
+@app.get("/api/profile/{username}")
+def profile(username: str):
+    def f():
+        p = get_profile(username)
+        return {"username": p.username, "full_name": p.full_name, "biography": p.biography,
+                "followers": p.followers, "followees": p.followees, "post_count": p.mediacount,
+                "is_private": p.is_private, "is_verified": p.is_verified,
+                "profile_pic": p.profile_pic_url, "external_url": p.external_url,
+                "following": p.followed_by_viewer, "requested": p.has_requested_viewer,
+                "locked": blocked(p)}
+    return cached(f"p:{username}", f)
+
+@app.post("/api/follow/{username}")
+def follow(username: str):
+    p = get_profile(username)
+    if not p.followed_by_viewer:
+        try:
+            p.follow()
+        except Exception as e:
+            raise HTTPException(400, str(e))
+    _cache.clear()
+    return {"following": True, "requested": p.is_private}
+
+@app.get("/api/posts/{username}")
+def posts(username: str, limit: int = Query(24, le=100)):
+    def f():
+        p = get_profile(username)
+        if blocked(p):
+            return {"items": [], "locked": True}
+        items = []
+        for n in p.get_posts():
+            items.append(ser(n))
+            if len(items) >= limit:
+                break
+        return {"items": items, "locked": False}
+    return cached(f"posts:{username}:{limit}", f)
+
+@app.get("/api/stories/{username}")
+def stories(username: str):
+    def f():
+        p = get_profile(username)
+        if blocked(p):
+            return {"items": [], "locked": True}
+        items = [ser(i, "story") for s in ctx().get_stories(userids=[p.userid]) for i in s.get_items()]
+        items.sort(key=lambda x: x["taken_at"])
+        return {"items": items, "locked": False}
+    return cached(f"st:{username}", f, STORY_TTL)
+
+@app.get("/api/highlights/{username}")
+def highlights(username: str):
+    def f():
+        p = get_profile(username)
+        if blocked(p):
+            return {"items": [], "locked": True}
+        return {"items": [{"id": h.unique_id, "title": h.title, "cover": h.cover_url,
+                           "count": h.itemcount} for h in ctx().get_highlights(p)], "locked": False}
+    return cached(f"hl:{username}", f)
+
+@app.get("/api/highlight/{unique_id}")
+def highlight_items(unique_id: str):
+    def f():
+        hl = instaloader.Highlight.from_id(ctx().context, int(unique_id))
+        return {"title": hl.title, "items": [ser(i, "story") for i in hl.get_items()]}
+    return cached(f"hli:{unique_id}", f)
+
+@app.get("/api/reposts/{username}")
+def reposts(username: str, limit: int = Query(24, le=100)):
+    def f():
+        p = get_profile(username)
+        if blocked(p):
+            return {"items": [], "locked": True}
+        raw = ctx().context.get_raw(
+            f"https://www.instagram.com/api/v1/feed/user/{p.userid}/reposts/?count={limit}")
+        out = []
+        for entry in json.loads(raw).get("items", []):
+            m = entry.get("media", entry)
+            car = []
+            for c in m.get("carousel_media") or []:
+                cand = (c.get("image_versions2", {}).get("candidates") or [{}])[0].get("url")
+                vid = (c.get("video_versions") or [{}])[0].get("url")
+                car.append({"is_video": c.get("media_type") == 2, "url": vid or cand, "thumb": cand})
+            cand = (m.get("image_versions2", {}).get("candidates") or [{}])[0].get("url")
+            vid = (m.get("video_versions") or [{}])[0].get("url")
+            out.append({"id": m.get("code") or m.get("pk"), "kind": "repost",
+                        "is_video": m.get("media_type") == 2, "thumb": cand, "url": vid or cand,
+                        "caption": ((m.get("caption") or {}).get("text")) or "",
+                        "likes": m.get("like_count"), "comments": m.get("comment_count"),
+                        "taken_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(m.get("taken_at", 0))),
+                        "carousel": car})
+        return {"items": out, "locked": False}
+    return cached(f"rp:{username}:{limit}", f)
+
+@app.get("/api/media")
+async def media(url: str):
+    host = urlparse(url).netloc
+    if not any(host == a.lstrip(".") or host.endswith(a) for a in ALLOWED):
+        raise HTTPException(400, "host not allowed")
+    client = httpx.AsyncClient(follow_redirects=True, timeout=30)
+    up = await client.send(client.build_request(
+        "GET", url, headers={"Referer": "https://www.instagram.com/", "User-Agent": UA}), stream=True)
+    if up.status_code != 200:
+        await up.aclose(); await client.aclose()
+        raise HTTPException(up.status_code, "upstream failed")
+    hdrs = {"Cache-Control": "public, max-age=86400"}
+    for h in ("content-type", "content-length", "accept-ranges"):
+        if h in up.headers:
+            hdrs[h] = up.headers[h]
+    async def done():
+        await up.aclose(); await client.aclose()
+    return StreamingResponse(up.aiter_raw(), headers=hdrs, background=done)
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTML
+
+HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>viewer</title>
+<style>
+:root{--bg:#0b0b0d;--card:#141418;--line:#242429;--fg:#f3f3f5;--dim:#8a8a95;--acc:#2f6fed}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:860px;margin:0 auto;padding:22px}
+.top{display:flex;gap:8px;margin-bottom:22px}
+input{flex:1;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;color:var(--fg);font:inherit;outline:0}
+input:focus{border-color:var(--acc)}
+button{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:12px 20px;font:inherit;font-weight:600;cursor:pointer}
+button:disabled{opacity:.5}
+.hero{padding:56px 0 40px;text-align:center}
+.hero h1{font-size:24px;margin:0 0 10px;font-weight:600}
+.hero p{color:var(--dim);margin:0 auto;max-width:440px;font-size:13.5px}
+.hd{display:flex;gap:20px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px}
+.av{width:84px;height:84px;border-radius:50%;flex:none;object-fit:cover;background:var(--line)}
+.nm{font-size:17px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pill{font-size:11px;padding:2px 8px;border-radius:20px;border:1px solid var(--line);color:var(--dim);font-weight:400}
+.stats{display:flex;gap:22px;margin-top:12px;font-size:13px}.stats span{color:var(--dim)}
+.bio{margin-top:10px;white-space:pre-wrap;color:#cfcfd6;font-size:13px}
+.tabs{display:flex;margin:18px 0 14px;border-bottom:1px solid var(--line)}
+.tabs button{flex:1;background:0;border:0;border-bottom:2px solid transparent;color:var(--dim);padding:12px 0;border-radius:0;font-weight:600}
+.tabs button.on{color:var(--fg);border-bottom-color:var(--acc)}
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}
+.grid a{position:relative;aspect-ratio:1;background:var(--line);border-radius:5px;overflow:hidden;display:block;cursor:pointer}
+.grid img{width:100%;height:100%;object-fit:cover;display:block}
+.vtag{position:absolute;top:6px;right:6px;font-size:10px;background:#000a;padding:1px 5px;border-radius:4px}
+.row{display:flex;gap:14px;overflow-x:auto;padding:6px 0 16px}
+.row>div{text-align:center;flex:none;cursor:pointer;width:76px}
+.ring{width:72px;height:72px;border-radius:50%;padding:2.5px;background:linear-gradient(135deg,#f59e0b,#ec4899)}
+.ring img{width:100%;height:100%;border-radius:50%;object-fit:cover;border:3px solid var(--bg)}
+.row small{display:block;margin-top:6px;color:var(--dim);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.empty{padding:64px 20px;text-align:center;color:var(--dim);font-size:13px}
+.empty b{display:block;color:var(--fg);margin-bottom:8px;font-size:15px}
+.err{background:#3a1417;border:1px solid #6b2226;color:#ffb4b4;padding:12px 14px;border-radius:10px;margin-bottom:16px;font-size:13px}
+.warn{background:#3a2c12;border:1px solid #6b5222;color:#ffd8a0;padding:12px 14px;border-radius:10px;margin:14px 0 0;font-size:13px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.lb{position:fixed;inset:0;background:#000e;display:flex;align-items:center;justify-content:center;z-index:50;padding:20px}
+.lb img,.lb video{max-width:min(720px,92vw);max-height:86vh;object-fit:contain;border-radius:8px}
+.lb .x{position:absolute;top:14px;right:20px;background:0;border:0;color:#fff;font-size:32px;cursor:pointer}
+.cap{position:absolute;bottom:20px;left:20px;right:20px;max-width:720px;margin:0 auto;color:#ddd;font-size:13px}
+.prog{position:absolute;top:14px;left:20px;right:60px;display:flex;gap:4px}
+.prog i{flex:1;height:2.5px;background:#fff3;border-radius:2px;overflow:hidden}
+.prog i b{display:block;height:100%;width:0;background:#fff}
+.sk{background:var(--line);border-radius:8px}
+</style></head><body><div class="wrap">
+<div class="top"><input id="q" placeholder="username" spellcheck="false" autocomplete="off"><button id="go">View</button></div>
+<div id="err"></div><div id="out"></div></div><script>
+const $=s=>document.querySelector(s),out=$('#out');
+const px=u=>u?`/api/media?url=${encodeURIComponent(u)}`:'';
+const esc=s=>(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let user=null,tab='posts';
+async function api(p,opt){const r=await fetch(p,opt);if(!r.ok)throw new Error((await r.json().catch(()=>({}))).detail||r.statusText);return r.json();}
+const fail=m=>$('#err').innerHTML=`<div class="err">${esc(m)}</div>`;
+function landing(){out.innerHTML=`<div class="hero"><h1>Look up any profile</h1><p>Posts, stories, highlights and reposts — including private accounts the session follows.</p></div>`;}
+async function load(u){
+  user=u;$('#err').innerHTML='';
+  out.innerHTML='<div class="hd"><div class="av sk"></div><div style="flex:1"><div class="sk" style="height:16px;width:40%"></div></div></div>';
+  let p;try{p=await api('/api/profile/'+encodeURIComponent(u));}catch(e){out.innerHTML='';return fail(e.message);}
+  out.innerHTML=`<div class="hd"><img class="av" src="${px(p.profile_pic)}" alt="">
+    <div style="flex:1;min-width:0"><div class="nm">${esc(p.username)}${p.is_verified?'<span class="pill">verified</span>':''}${p.is_private?'<span class="pill">private</span>':''}</div>
+      <div style="color:var(--dim);font-size:13px">${esc(p.full_name)}</div>
+      <div class="stats"><div><b>${p.post_count}</b> <span>posts</span></div><div><b>${p.followers.toLocaleString()}</b> <span>followers</span></div><div><b>${p.followees.toLocaleString()}</b> <span>following</span></div></div>
+      <div class="bio">${esc(p.biography)}</div>
+      ${p.locked?`<div class="warn"><span>Session account doesn't follow @${esc(p.username)}, so Instagram hides everything.</span><button id="flw" style="padding:8px 14px;font-size:12.5px">Follow</button></div>`:p.requested?`<div class="warn"><span>Follow request pending.</span></div>`:''}
+    </div></div>
+    <div class="tabs">${['posts','stories','highlights','reposts'].map(t=>`<button data-t="${t}" class="${t===tab?'on':''}">${t}</button>`).join('')}</div><div id="body"></div>`;
+  const fl=$('#flw');
+  if(fl)fl.onclick=async()=>{fl.disabled=true;fl.textContent='…';try{await api('/api/follow/'+encodeURIComponent(user),{method:'POST'});await load(user);}catch(e){fl.disabled=false;fl.textContent='Follow';fail(e.message);}};
+  out.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;tabLoad();});
+  tabLoad();
+}
+async function tabLoad(){
+  out.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.t===tab));
+  const body=$('#body');body.innerHTML='<div class="empty">loading…</div>';
+  try{
+    if(tab==='posts'||tab==='reposts'){
+      const d=await api(`/api/${tab}/`+encodeURIComponent(user));
+      body.innerHTML=d.items.length?`<div class="grid">${d.items.map((m,i)=>`<a data-i="${i}"><img src="${px(m.thumb)}" loading="lazy" alt="">${m.is_video?'<span class="vtag">video</span>':''}</a>`).join('')}</div>`:`<div class="empty"><b>nothing here</b>${d.locked?'session does not follow this account':'no items returned'}</div>`;
+      body.querySelectorAll('.grid a').forEach(a=>a.onclick=()=>lightbox(d.items[+a.dataset.i]));
+    }
+    if(tab==='stories'){
+      const d=await api('/api/stories/'+encodeURIComponent(user));
+      body.innerHTML=d.items.length?`<div class="row">${d.items.map((m,i)=>`<div data-i="${i}"><div class="ring"><img src="${px(m.thumb)}" alt=""></div><small>${new Date(m.taken_at).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})}</small></div>`).join('')}</div>`:`<div class="empty"><b>no active stories</b>${d.locked?'session does not follow this account':'expired or none posted'}</div>`;
+      body.querySelectorAll('.row>div').forEach(el=>el.onclick=()=>player(d.items,+el.dataset.i));
+    }
+    if(tab==='highlights'){
+      const d=await api('/api/highlights/'+encodeURIComponent(user));
+      body.innerHTML=d.items.length?`<div class="row">${d.items.map(h=>`<div data-id="${esc(h.id)}"><div class="ring"><img src="${px(h.cover)}" alt=""></div><small>${esc(h.title)}</small></div>`).join('')}</div>`:`<div class="empty"><b>no highlights</b>${d.locked?'session does not follow this account':'none created'}</div>`;
+      body.querySelectorAll('.row>div').forEach(el=>el.onclick=async()=>{try{const hl=await api('/api/highlight/'+el.dataset.id);player(hl.items,0);}catch(e){fail(e.message);}});
+    }
+  }catch(e){body.innerHTML=`<div class="empty"><b>failed</b>${esc(e.message)}</div>`;}
+}
+function lightbox(m){
+  if(!m)return;const el=document.createElement('div');el.className='lb';
+  el.innerHTML=`<button class="x">&times;</button>${m.is_video?`<video src="${px(m.url)}" controls autoplay playsinline></video>`:`<img src="${px(m.url)}" alt="">`}${m.caption?`<div class="cap">${esc(m.caption)}</div>`:''}`;
+  el.onclick=e=>{if(e.target===el||e.target.classList.contains('x'))el.remove();};
+  document.body.appendChild(el);
+}
+function player(items,i){
+  if(!items.length)return;const el=document.createElement('div');el.className='lb';let n=i,timer;
+  const draw=()=>{const m=items[n];
+    el.innerHTML=`<div class="prog">${items.map((_,k)=>`<i><b style="width:${k<n?100:0}%"></b></i>`).join('')}</div><button class="x">&times;</button>${m.is_video?`<video src="${px(m.url)}" autoplay playsinline muted></video>`:`<img src="${px(m.url)}" alt="">`}<div style="position:absolute;inset:0;display:flex"><div style="flex:1" data-d="-1"></div><div style="flex:1" data-d="1"></div></div>`;
+    const bar=el.querySelectorAll('.prog b')[n];clearInterval(timer);let w=0;
+    timer=setInterval(()=>{w+=1.1;bar.style.width=Math.min(w,100)+'%';if(w>=100)step(1);},60);
+    el.querySelectorAll('[data-d]').forEach(z=>z.onclick=e=>{e.stopPropagation();step(+z.dataset.d);});
+    el.querySelector('.x').onclick=()=>{clearInterval(timer);el.remove();};};
+  const step=d=>{n+=d;if(n<0||n>=items.length){clearInterval(timer);return el.remove();}draw();};
+  document.body.appendChild(el);draw();
+}
+const go=()=>{const v=$('#q').value.trim();if(v)load(v.replace(/^@/,''));};
+$('#go').onclick=go;$('#q').onkeydown=e=>{if(e.key==='Enter')go();};
+fetch('/api/health').then(r=>r.json()).then(h=>{h.ok?landing():out.innerHTML='<div class="err">No session file. Run <code>python app.py --login</code>.</div>';}).catch(landing);
+</script></body></html>"""
+
+def do_login():
+    user = IG_USER or input("burner IG username: ").strip()
+    L2 = instaloader.Instaloader(quiet=True)
+    try:
+        L2.login(user, getpass.getpass("password: "))
+    except instaloader.exceptions.TwoFactorAuthRequiredException:
+        L2.two_factor_login(input("2FA code: ").strip())
+    L2.save_session_to_file(str(SESSION_FILE))
+    print("session saved")
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--login", action="store_true")
+    ap.add_argument("--port", type=int, default=int(os.environ.get("PORT", 8000)))
+    a = ap.parse_args()
+    if a.login:
+        do_login()
+        sys.exit(0)
+    restore_session()
+    uvicorn.run(app, host="0.0.0.0", port=a.port, log_level="warning")
